@@ -153,8 +153,14 @@ Both the simulator and the Massive client implement the same abstract interface.
 - Updates at ~500ms intervals
 - Correlated moves across tickers (e.g., tech stocks move together)
 - Occasional random "events" — sudden 2-5% moves on a ticker for drama
-- Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.)
+- Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.) for the 10 default tickers
+- For any other ticker added later (via the UI or the LLM), the simulator deterministically derives a starting seed price from the ticker symbol (e.g., a hash mapped into a $10–$500 range) so any valid ticker can be watched, priced, and traded immediately — no fixed allowlist
 - Runs as an in-process background task — no external dependencies
+
+### Ticker Validation
+
+- A ticker is accepted if it matches a simple symbol format (1–5 uppercase letters, e.g. `^[A-Z]{1,5}$`); anything else is rejected with a 400 on `POST /api/watchlist` and on LLM-issued `watchlist_changes`
+- This is format validation only, not a real-symbol lookup — the simulator (and Massive, if the symbol happens to exist there) will happily price a fictitious-but-well-formed ticker
 
 ### Massive API (Optional)
 
@@ -175,7 +181,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
+- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist. This stays a clean equivalence because §8's `DELETE /api/watchlist/{ticker}` blocks removal while a position is open, so a priced ticker never has to keep streaming on behalf of an orphaned position
 - Each SSE event contains ticker, price, previous price, timestamp, and change direction
 - Client handles reconnection automatically (EventSource has built-in retry)
 
@@ -258,14 +264,14 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 |--------|------|-------------|
 | GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L |
 | POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
-| GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
+| GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart). Defaults to the last 24h; accepts optional `since` / `limit` query params for a wider range |
 
 ### Watchlist
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/watchlist` | Current watchlist tickers with latest prices |
-| POST | `/api/watchlist` | Add a ticker: `{ticker}` |
-| DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
+| POST | `/api/watchlist` | Add a ticker: `{ticker}` (1–5 uppercase letters; 400 if malformed) |
+| DELETE | `/api/watchlist/{ticker}` | Remove a ticker from the watchlist. Blocked with a 409 if the user holds an open position in that ticker — sell the position first, then remove it |
 
 ### Chat
 | Method | Path | Description |
@@ -281,7 +287,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ## 9. LLM Integration
 
-When writing code to make calls to LLMs, use cerebras-inference skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
+When writing code to make calls to LLMs, use the `cerebras` skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
 
 There is an OPENROUTER_API_KEY in the .env file in the project root.
 
@@ -290,9 +296,9 @@ There is an OPENROUTER_API_KEY in the .env file in the project root.
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads the last 20 messages (10 turns) of conversation history from the `chat_messages` table
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
+4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the `cerebras` skill
 5. Parses the complete structured JSON response
 6. Auto-executes any trades or watchlist changes specified in the response
 7. Stores the message and executed actions in `chat_messages`
@@ -309,14 +315,15 @@ The LLM is instructed to respond with JSON matching this schema:
     {"ticker": "AAPL", "side": "buy", "quantity": 10}
   ],
   "watchlist_changes": [
-    {"ticker": "PYPL", "action": "add"}
+    {"ticker": "PYPL", "action": "add"},
+    {"ticker": "NFLX", "action": "remove"}
   ]
 }
 ```
 
 - `message` (required): The conversational text shown to the user
-- `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells)
-- `watchlist_changes` (optional): Array of watchlist modifications
+- `trades` (optional): Array of at most 10 trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells); any trades beyond the first 10 in a single response are ignored and reported back as an error so the LLM can inform the user
+- `watchlist_changes` (optional): Array of watchlist modifications. `action` is `"add"` or `"remove"`, and each goes through the same validation as the manual API — in particular, a `"remove"` for a ticker with an open position is rejected and reported back as an error so the LLM can inform the user
 
 ### Auto-Execution
 
@@ -393,13 +400,15 @@ FastAPI serves the static frontend files and all API routes on port 8000.
 
 ### Docker Volume
 
-The SQLite database persists via a named Docker volume:
+The SQLite database persists via a bind mount of the project's `db/` directory (matching §4, where `db/` is a real, gitignored-but-present directory in the repo — not a Docker-managed named volume):
 
 ```bash
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+docker run -v "$(pwd)/db:/app/db" -p 8000:8000 --env-file .env finally
 ```
 
-The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
+(Windows PowerShell: `-v "${PWD}/db:/app/db"`.)
+
+The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path, so the file is visible on the host filesystem and persists across container restarts and rebuilds.
 
 ### Start/Stop Scripts
 
@@ -420,6 +429,8 @@ All scripts should be idempotent — safe to run multiple times.
 ### Optional Cloud Deployment
 
 The container is designed to deploy to AWS App Runner, Render, or any container platform. A Terraform configuration for App Runner may be provided in a `deploy/` directory as a stretch goal, but is not part of the core build.
+
+⚠️ The app has no authentication by design (§3, §7) — fine for local/single-user use, but a public deployment must not be exposed without adding at least a shared secret or IP allowlist in front of it. Without one, anyone with the URL can spend the `OPENROUTER_API_KEY` budget via `/api/chat` and freely reset/trade the paper portfolio.
 
 ---
 
@@ -454,3 +465,29 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Doc Review Log
+
+*History of the doc-review pass and its resolution. The open questions this section originally raised have all been resolved and incorporated into the sections above; kept here for traceability.*
+
+1. **Watchlist vs. positions — price coverage gap.** ✅ Resolved — of the two options raised, the user chose (b): §8's `DELETE /api/watchlist/{ticker}` (and the LLM's `watchlist_changes` "remove" in §9) now blocks removal with a 409/error while a position is open, so the watchlist stays a clean 1:1 match for the SSE-priced ticker set (§6) and a position can never outlive its ticker's price feed.
+
+2. **Unknown tickers in the simulator.** ✅ Resolved — §6 now describes a deterministic hash-derived seed price for tickers outside the 10 defaults, plus a new "Ticker Validation" subsection covering symbol-format validation (1–5 uppercase letters).
+
+3. **`watchlist_changes.action` enum.** ✅ Resolved — §9's schema example and bullet now show both `"add"` and `"remove"` explicitly.
+
+4. **Chat history window.** ✅ Resolved — §9 step 2 now specifies "the last 20 messages (10 turns)."
+
+5. **Cap on trades-per-chat-response.** ✅ Resolved — §9's `trades` schema bullet now caps a single response at 10 trades, with excess trades ignored and reported back as an error.
+
+6. **Docker volume: bind mount vs. named volume.** ✅ Resolved — §11's Docker Volume section now uses a bind mount (`-v "$(pwd)/db:/app/db"`), consistent with §4's description of `db/` as a real repo directory.
+
+7. **Unauthenticated + optional cloud deployment.** ✅ Resolved — §11's Optional Cloud Deployment section now carries an explicit warning against exposing the app publicly without a shared secret or IP allowlist.
+
+8. **`portfolio_snapshots` growth / query shape.** ✅ Resolved — §8's `GET /api/portfolio/history` row now defaults to the last 24h with optional `since`/`limit` params.
+
+9. **`cerebras-inference` skill name.** ✅ Resolved — §9 now refers to the `cerebras` skill throughout, matching the skill's actual registered name.
+
+**Simplification suggestions:** three were proposed in the original doc-review pass (renaming `backend/db/`, phasing the simulator's correlated-moves/event complexity, and consolidating on a single Docker workflow). All three were reviewed and declined — the plan's existing structure stands as written.

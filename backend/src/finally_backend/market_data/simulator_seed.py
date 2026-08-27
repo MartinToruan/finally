@@ -8,6 +8,7 @@ plausible-looking drift/volatility — see planning/MARKET_SIMULATOR.md §4.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 
 from .simulator_state import TickerState
@@ -48,9 +49,15 @@ def derive_seed_price(ticker: str) -> float:
 
 
 def derive_seed_state(ticker: str) -> TickerState:
-    """Deterministic seed state for a ticker outside DEFAULT_SEEDS."""
+    """Deterministic seed state for any ticker, curated or not.
+
+    Always returns a fresh TickerState, never a shared DEFAULT_SEEDS
+    instance — TickerState is mutable, and a caller (e.g. a simulator's
+    tick loop) mutating a shared instance in place would corrupt the global
+    seed table for every other caller in the process.
+    """
     if ticker in DEFAULT_SEEDS:
-        return DEFAULT_SEEDS[ticker]
+        return dataclasses.replace(DEFAULT_SEEDS[ticker])
     digest = hashlib.sha256(ticker.encode("utf-8")).hexdigest()
     price = derive_seed_price(ticker)
     # Also derive plausible-looking drift/volatility from the hash, in

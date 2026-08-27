@@ -59,20 +59,28 @@ class MassiveProvider(MarketDataProvider):
         self._cache.remove(ticker)
 
     async def _poll_loop(self) -> None:
-        try:
-            while True:
-                try:
-                    await self._poll_once()
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 429:
-                        logger.warning("Massive API rate limited; will retry next cycle")
-                    else:
-                        logger.warning("Massive API error %s; keeping last known prices", exc)
-                except httpx.HTTPError as exc:
-                    logger.warning("Massive API network error: %s; keeping last known prices", exc)
-                await asyncio.sleep(self._poll_interval)
-        except asyncio.CancelledError:
-            raise
+        while True:
+            try:
+                await self._poll_once()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429:
+                    logger.warning("Massive API rate limited; will retry next cycle")
+                else:
+                    logger.warning("Massive API error %s; keeping last known prices", exc)
+            except httpx.HTTPError as exc:
+                logger.warning("Massive API network error: %s; keeping last known prices", exc)
+            except Exception:
+                # Anything else - a malformed/unexpected response body (bad
+                # JSON, a row missing an expected field, an unexpected shape)
+                # - gets the same fail-soft treatment as the HTTP-level
+                # errors above: skip this cycle, keep the last known prices,
+                # try again next cycle. Without this, a single odd response
+                # would kill the polling task permanently and silently.
+                # asyncio.CancelledError is a BaseException (not Exception in
+                # Python 3.8+), so a real cancellation from stop() always
+                # propagates through this untouched.
+                logger.exception("Massive API poll cycle failed unexpectedly; keeping last known prices")
+            await asyncio.sleep(self._poll_interval)
 
     async def _poll_once(self) -> None:
         if not self._tickers:
@@ -84,10 +92,17 @@ class MassiveProvider(MarketDataProvider):
         body = resp.json()
         now = datetime.now(timezone.utc)
         for row in body.get("tickers", []):
+            ticker = row.get("ticker")
+            if ticker is None or ticker not in self._tickers:
+                # Missing "ticker" key entirely, or removed from the
+                # watchlist while this poll was in flight (remove_ticker()
+                # already cleared the cache for it - don't resurrect it with
+                # this now-stale response).
+                continue
             price = row.get("day", {}).get("c")
             if price is None:
                 continue  # no trading activity yet today; keep last known price
-            await self._cache.update(row["ticker"], price, now)
+            await self._cache.update(ticker, price, now)
         # Any ticker in self._tickers that Massive didn't return a row for
         # (e.g. a fictitious/unlisted symbol - planning/MASSIVE_API.md §8) is
         # simply left untouched in the cache this cycle.

@@ -51,6 +51,7 @@ class ProviderHarness:
 @pytest.fixture(params=["simulator", "massive"])
 async def harness(request: pytest.FixtureRequest):
     cache = PriceCache()
+    client: httpx.AsyncClient | None = None
     if request.param == "simulator":
         provider: object = SimulatorProvider(cache, tick_seconds=3600.0)
     else:
@@ -60,6 +61,11 @@ async def harness(request: pytest.FixtureRequest):
     h = ProviderHarness(request.param, provider, cache)
     yield h
     await provider.stop()
+    # provider.stop() doesn't close a client passed in explicitly (that's
+    # the caller's client to manage) - close it here so the fixture doesn't
+    # leak it.
+    if client is not None:
+        await client.aclose()
 
 
 async def test_start_populates_the_cache(harness: ProviderHarness):

@@ -7,6 +7,10 @@
 runtime probes for the specific hazards noted below — not a full fuzzing or
 load-testing pass.*
 
+**Update, same day**: all five findings below have been fixed. See
+"Resolution" at the end of this document for what changed, the regression
+tests added for each, and the final test count.
+
 ## Summary
 
 The market data layer implements the full design from the three planning
@@ -320,3 +324,34 @@ and 2 should be fixed before this provider is exercised against a real
 Massive API key in anything resembling a longer-running deployment, since
 Finding 2 in particular causes a silent, permanent, un-self-healing loss of
 live pricing.
+
+---
+
+## Resolution
+
+All five findings were fixed the same day this review was written. Each fix
+was verified two ways: (1) the exact runtime repro used to originally
+demonstrate the bug was re-run against the fixed code and confirmed clean,
+and (2) a permanent regression test was added to the suite.
+
+| # | Fix | Files changed | Regression test |
+|---|---|---|---|
+| 1 | `_poll_once()` now re-checks `self._tickers` membership (a fresh read, not the snapshot taken before the request went out) before writing any row to the cache, so a ticker removed while its poll was in flight can no longer be resurrected by the stale response. | `massive_provider.py` | `test_removing_ticker_mid_poll_does_not_resurrect_its_price` |
+| 2 | `_poll_once()` now looks up `row.get("ticker")` (not `row["ticker"]`) and skips any row with no ticker field, instead of raising. `_poll_loop` also gained a catch-all `except Exception` branch (logged, not re-raised) alongside the existing `httpx.HTTPStatusError`/`httpx.HTTPError` branches, so *any* unexpected failure during a poll cycle — bad JSON, wrong response shape, whatever — gets the same fail-soft treatment as an HTTP-level error. `asyncio.CancelledError` is unaffected (`BaseException`, not `Exception`, in Python 3.8+), so `stop()` still cancels cleanly. | `massive_provider.py` | `test_row_missing_ticker_key_is_skipped_not_raised`, `test_poll_loop_survives_a_completely_malformed_response_body` |
+| 3 | `TICKER_PATTERN` now anchors with `\Z` instead of `$`, which (unlike `$`) doesn't also match just before a trailing `\n`. | `validation.py` | 3 new cases added to the existing `test_invalid_tickers` parametrization (`"AAPL\n"`, `"AAPL\r\n"`, `"\nAAPL"`) |
+| 4 | `derive_seed_state()` now returns `dataclasses.replace(DEFAULT_SEEDS[ticker])` for curated tickers instead of the live shared instance, so the function is safe by construction for *any* caller, not just the one call site that happened to copy defensively before calling it. `SimulatorProvider._seed()` was simplified to a direct delegation to `derive_seed_state()`, since it no longer needs its own copy-on-the-caller's-side workaround. | `simulator_seed.py`, `simulator.py` | `test_derive_seed_state_returns_a_copy_not_the_shared_default_instance` (plus the existing identity assertion in `test_derive_seed_state_returns_curated_state_for_default_tickers` was changed from `is` to `==`, since the return value is now a copy) |
+| 5 | The `harness` fixture in the shared conformance suite now closes the `httpx.AsyncClient` it explicitly constructs and passes to `MassiveProvider`, since the provider correctly leaves an externally-supplied client for its owner to close. | `test_provider_conformance.py` | N/A — test-only hygiene fix, nothing to regress |
+
+**Final test run**: `uv run pytest -q` → **93 passed, 0 failed, 0.89s**
+(86 pre-existing + 7 new: 3 new parametrized cases, 4 new test functions).
+
+**Re-verification of the original repros against the fixed code**:
+```
+Finding 1 — cache AFTER in-flight response landed: None            (was: a resurrected PriceUpdate)
+Finding 2 — task done? False / stop() returned cleanly             (was: task crashed, stop() raised KeyError('ticker'))
+Finding 3 — is_valid_ticker("AAPL\n") → False                      (was: True)
+```
+
+No further open findings. The market data backend (`SimulatorProvider`,
+`MassiveProvider`, `PriceCache`, `create_provider()`, and ticker validation)
+is ready to be built on by the rest of the backend.

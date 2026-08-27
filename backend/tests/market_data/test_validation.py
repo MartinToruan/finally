@@ -20,6 +20,9 @@ def test_valid_tickers(ticker: str):
         "AAPL1",  # digit
         "AAPL!",  # punctuation
         "ABCDEF",  # 6 letters, too long
+        "AAPL\n",  # regression: trailing newline (MARKET_DATA_REVIEW.md Finding 3)
+        "AAPL\r\n",  # regression: trailing CRLF
+        "\nAAPL",  # leading newline
     ],
 )
 def test_invalid_tickers(ticker: str):

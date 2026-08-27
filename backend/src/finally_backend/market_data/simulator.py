@@ -8,13 +8,12 @@ jumps. See planning/MARKET_SIMULATOR.md for the full design.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
 from datetime import datetime, timezone
 
 from .base import MarketDataProvider
 from .cache import PriceCache
-from .simulator_seed import DEFAULT_SEEDS, derive_seed_state
+from .simulator_seed import derive_seed_state
 from .simulator_state import TickerState
 from .steps import TICK_SECONDS, DT, maybe_trigger_event, step_all
 
@@ -55,14 +54,9 @@ class SimulatorProvider(MarketDataProvider):
         self._cache.remove(ticker)
 
     def _seed(self, ticker: str) -> TickerState:
-        # dataclasses.replace() copies rather than reusing the DEFAULT_SEEDS
-        # instance directly — TickerState is mutable and _tick() updates
-        # state.price in place, so returning the shared instance would let
-        # one provider's price walk corrupt the global seed table for every
-        # other provider (and test) in the process.
-        template = DEFAULT_SEEDS.get(ticker)
-        if template is not None:
-            return dataclasses.replace(template)
+        # derive_seed_state() always returns a fresh TickerState (curated or
+        # not) — safe to mutate in place via _tick() without corrupting
+        # shared state. See simulator_seed.py.
         return derive_seed_state(ticker)
 
     async def _run_loop(self) -> None:

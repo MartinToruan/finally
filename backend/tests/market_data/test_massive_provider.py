@@ -140,6 +140,54 @@ async def test_poll_once_raises_on_network_error(cache: PriceCache):
         await provider.stop()
 
 
+async def test_row_missing_ticker_key_is_skipped_not_raised(cache: PriceCache):
+    """Regression test for MARKET_DATA_REVIEW.md Finding 2: a row with no
+    "ticker" field (malformed/unexpected response shape) must be skipped,
+    not raise — the other, well-formed rows in the same response should
+    still update normally."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = snapshot_body([{"day": {"c": 190.0}}, snapshot_row("GOOGL", 175.0)])
+        return httpx.Response(200, json=body)
+
+    provider = make_provider(cache, handler)
+    provider._tickers = {"AAPL", "GOOGL"}
+    try:
+        await provider._poll_once()  # must not raise KeyError
+        assert cache.get("AAPL") is None
+        assert cache.get("GOOGL").price == 175.0
+    finally:
+        await provider.stop()
+
+
+async def test_poll_loop_survives_a_completely_malformed_response_body(cache: PriceCache):
+    """Regression test for MARKET_DATA_REVIEW.md Finding 2: a response
+    shape parsing errors don't propagate past _poll_once (e.g. "tickers" is
+    not a list at all) must not permanently kill the background polling
+    task — it's fail-soft, just like an HTTP-level error."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Completely wrong shape: "tickers" is a string, not a list of
+            # row objects - iterating it yields characters, and
+            # row.get("ticker") on a character raises AttributeError.
+            return httpx.Response(200, json={"status": "OK", "tickers": "not-a-list"})
+        return httpx.Response(200, json=snapshot_body([snapshot_row("AAPL", 190.0)]))
+
+    provider = make_provider(cache, handler, poll_interval_seconds=0.02)
+    try:
+        await provider.start({"AAPL"})
+        await asyncio.sleep(0.1)  # first cycle malformed, later cycles recover
+        assert call_count >= 2
+        assert not provider._task.done()  # loop survived the bad cycle
+        assert cache.get("AAPL").price == 190.0  # recovered on a later cycle
+    finally:
+        await provider.stop()  # must not raise — regression check for stop()
+
+
 async def test_poll_loop_survives_errors_and_keeps_serving_last_known_price(cache: PriceCache):
     """Fail-soft behavior (planning/MASSIVE_API.md §6): a bad cycle logs and
     waits for the next one rather than crashing the loop or blanking the
@@ -177,6 +225,34 @@ async def test_add_and_remove_ticker_mutate_watched_set(cache: PriceCache):
         await provider.remove_ticker("AAPL")
         assert "AAPL" not in provider._tickers
         assert cache.get("AAPL") is None  # cache entry cleared too
+    finally:
+        await provider.stop()
+
+
+async def test_removing_ticker_mid_poll_does_not_resurrect_its_price(cache: PriceCache):
+    """Regression test for MARKET_DATA_REVIEW.md Finding 1: if a ticker is
+    removed from the watchlist while a poll for it is still in flight, the
+    stale in-flight response must not repopulate the cache entry that
+    remove_ticker() just cleared."""
+    response_ready = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await response_ready.wait()  # hold the response until told to proceed
+        return httpx.Response(200, json=snapshot_body([snapshot_row("AAPL", 190.0)]))
+
+    provider = make_provider(cache, handler)
+    provider._tickers = {"AAPL"}
+    try:
+        poll_task = asyncio.create_task(provider._poll_once())
+        await asyncio.sleep(0.01)  # let the request go out and start waiting
+
+        await provider.remove_ticker("AAPL")
+        assert cache.get("AAPL") is None
+
+        response_ready.set()  # now let the stale response land
+        await poll_task
+
+        assert cache.get("AAPL") is None  # must still be absent
     finally:
         await provider.stop()
 

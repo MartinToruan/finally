@@ -29,7 +29,21 @@ def test_derive_seed_price_is_within_bounds(ticker: str):
 
 def test_derive_seed_state_returns_curated_state_for_default_tickers():
     state = derive_seed_state("AAPL")
-    assert state is DEFAULT_SEEDS["AAPL"]
+    assert state == DEFAULT_SEEDS["AAPL"]
+
+
+def test_derive_seed_state_returns_a_copy_not_the_shared_default_instance():
+    """Regression test: derive_seed_state() must never hand back the live
+    DEFAULT_SEEDS object for a curated ticker — TickerState is mutable, and
+    a caller mutating the shared instance would corrupt global state for
+    every other caller in the process (planning/MARKET_DATA_REVIEW.md
+    Finding 4)."""
+    state = derive_seed_state("AAPL")
+    assert state is not DEFAULT_SEEDS["AAPL"]
+
+    original_price = DEFAULT_SEEDS["AAPL"].price
+    state.price = 999999.0
+    assert DEFAULT_SEEDS["AAPL"].price == original_price
 
 
 def test_derive_seed_state_derives_state_for_unknown_ticker():
